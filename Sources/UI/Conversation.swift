@@ -140,6 +140,12 @@ public final class Conversation: @unchecked Sendable {
 		try client.send(event: event)
 	}
 
+	// PATCH (Chip): raw passthrough for events the typed API can't build, e.g.
+	// input_image conversation items (realtime-camera-video spec).
+	public func sendRaw(_ data: Data) throws {
+		try client.sendRaw(data)
+	}
+
 	/// Manually append audio bytes to the conversation.
 	/// Commit the audio to trigger a model response when server turn detection is disabled.
 	/// > Note: The `Conversation` class can automatically handle listening to the user's mic and playing back model responses.
@@ -178,6 +184,10 @@ private extension Conversation {
 				self.session = session
 			case let .conversationItemCreated(_, item, _):
 				entries.append(item)
+			case let .conversationItemAdded(_, item, _):
+				if !entries.contains(where: { $0.id == item.id }) {
+					entries.append(item)
+				}
 			case let .conversationItemDeleted(_, itemId):
 				entries.removeAll { $0.id == itemId }
 			case let .conversationItemInputAudioTranscriptionCompleted(_, itemId, contentIndex, transcript, _, _):

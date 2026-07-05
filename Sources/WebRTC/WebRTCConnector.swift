@@ -80,6 +80,13 @@ import FoundationNetworking
 		try dataChannel.sendData(LKRTCDataBuffer(data: encoder.encode(event), isBinary: false))
 	}
 
+	// PATCH (Chip): send a pre-serialized event straight to the data channel.
+	// Used for input_image conversation items, which the typed ClientEvent/Item
+	// models don't support (realtime-camera-video spec).
+	public func sendRaw(_ data: Data) throws {
+		try dataChannel.sendData(LKRTCDataBuffer(data: data, isBinary: false))
+	}
+
 	public func disconnect() {
 		connection.close()
 		stream.finish()
@@ -186,18 +193,16 @@ extension WebRTCConnector: LKRTCPeerConnectionDelegate {
 	public func peerConnection(_: LKRTCPeerConnection, didRemove _: [LKRTCIceCandidate]) {}
 	public func peerConnection(_: LKRTCPeerConnection, didChange _: LKRTCIceGatheringState) {}
 
-	public func peerConnection(_: LKRTCPeerConnection, didChange newState: LKRTCIceConnectionState) {
-		print("ICE Connection State changed to: \(newState)")
-	}
+	public func peerConnection(_: LKRTCPeerConnection, didChange newState: LKRTCIceConnectionState) {}
 }
 
 extension WebRTCConnector: LKRTCDataChannelDelegate {
 	public func dataChannel(_: LKRTCDataChannel, didReceiveMessageWith buffer: LKRTCDataBuffer) {
+		// Skip (don't crash the stream on) unknown/undecodable events. Patch:
+		// must NOT stream.finish(throwing:) here or one unknown event kills the
+		// whole voice session. Silent — no console dump of the event payload.
 		do { try stream.yield(decoder.decode(ServerEvent.self, from: buffer.data)) }
-		catch {
-			print("Failed to decode server event: \(String(data: buffer.data, encoding: .utf8) ?? "<invalid utf8>")")
-			stream.finish(throwing: error)
-		}
+		catch {}
 	}
 
 	public func dataChannelDidChangeState(_ dataChannel: LKRTCDataChannel) {
