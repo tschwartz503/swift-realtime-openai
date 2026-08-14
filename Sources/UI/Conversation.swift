@@ -146,6 +146,11 @@ public final class Conversation: @unchecked Sendable {
 		try client.sendRaw(data)
 	}
 
+	// PATCH (Chip): the connector is private, so the tapped remote audio is
+	// unreachable from app code without this. 16 kHz mono PCM16 of the model's
+	// voice, for driving a lip-synced avatar. Observing only.
+	public var remoteAudio: AsyncStream<Data> { client.remoteAudio }
+
 	/// Manually append audio bytes to the conversation.
 	/// Commit the audio to trigger a model response when server turn detection is disabled.
 	/// > Note: The `Conversation` class can automatically handle listening to the user's mic and playing back model responses.
