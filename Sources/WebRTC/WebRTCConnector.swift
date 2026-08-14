@@ -33,9 +33,10 @@ import FoundationNetworking
 	/// moment it arrives; see RemoteAudioTap for why this exists. Observing
 	/// only - playback is identical whether or not anything reads this.
 	private let audioTap = RemoteAudioTap()
-	private var remoteAudioTrack: LKRTCAudioTrack?
 
-	public var remoteAudio: AsyncStream<AVAudioPCMBuffer> { audioTap.buffers }
+	/// The model's voice as 16 kHz mono PCM16, for anything that needs to react
+	/// to Chip speaking. Observing only; playback is unaffected.
+	public var remoteAudio: AsyncStream<Data> { audioTap.pcm16 }
 
 	private let stream: AsyncThrowingStream<ServerEvent, Error>.Continuation
 
@@ -99,8 +100,7 @@ import FoundationNetworking
 		// Detach before closing: the renderer is retained by the track, and
 		// leaving it attached across sessions leaks the tap and can deliver
 		// buffers from a session the app has already torn down.
-		remoteAudioTrack?.removeRenderer(audioTap)
-		remoteAudioTrack = nil
+		audioTap.detach()
 		audioTap.finish()
 
 		connection.close()
@@ -204,9 +204,8 @@ extension WebRTCConnector: LKRTCPeerConnectionDelegate {
 		// The model's voice arrives here as a remote track. Attaching the tap is
 		// what makes the audio observable at all; upstream left this empty and
 		// let WebRTC render the track with nothing able to see it.
-		guard let track = stream.audioTracks.first, remoteAudioTrack == nil else { return }
-		remoteAudioTrack = track
-		track.addRenderer(audioTap)
+		guard let track = stream.audioTracks.first else { return }
+		audioTap.attach(to: track)
 	}
 	public func peerConnection(_: LKRTCPeerConnection, didOpen _: LKRTCDataChannel) {}
 	public func peerConnection(_: LKRTCPeerConnection, didRemove _: LKRTCMediaStream) {}
