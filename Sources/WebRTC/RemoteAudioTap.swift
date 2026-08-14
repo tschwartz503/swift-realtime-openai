@@ -69,12 +69,16 @@ public final class RemoteAudioTap: NSObject, LKRTCAudioRenderer, @unchecked Send
 	)!
 
 	override public init() {
-		// Newest-first with a small bound: a stalled consumer should drop stale
-		// audio rather than grow without limit or block render(pcmBuffer:),
-		// which runs on WebRTC's realtime audio thread.
+		// Unbounded, deliberately. A consumer that renders a talking head from
+		// these bytes re-speaks them: a dropped chunk is not a dropped frame,
+		// it is a syllable the face never says, and the mouth stays ahead of
+		// the audio for the rest of the turn. `yield` never blocks, so this
+		// cannot stall render(pcmBuffer:) on WebRTC's realtime thread either
+		// way - the only cost of not dropping is memory, and 16 kHz mono PCM16
+		// is 32 KB/s.
 		(pcm16, continuation) = AsyncStream.makeStream(
 			of: Data.self,
-			bufferingPolicy: .bufferingNewest(32)
+			bufferingPolicy: .unbounded
 		)
 		super.init()
 	}
