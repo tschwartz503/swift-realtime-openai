@@ -29,6 +29,14 @@ import FoundationNetworking
 	private let dataChannel: LKRTCDataChannel
 	private let connection: LKRTCPeerConnection
 
+	/// The model's spoken audio, as it plays. Attached to the remote track the
+	/// moment it arrives; see RemoteAudioTap for why this exists. Observing
+	/// only - playback is identical whether or not anything reads this.
+	private let audioTap = RemoteAudioTap()
+	private var remoteAudioTrack: LKRTCAudioTrack?
+
+	public var remoteAudio: AsyncStream<AVAudioPCMBuffer> { audioTap.buffers }
+
 	private let stream: AsyncThrowingStream<ServerEvent, Error>.Continuation
 
 	private static let factory: LKRTCPeerConnectionFactory = {
@@ -88,6 +96,13 @@ import FoundationNetworking
 	}
 
 	public func disconnect() {
+		// Detach before closing: the renderer is retained by the track, and
+		// leaving it attached across sessions leaks the tap and can deliver
+		// buffers from a session the app has already torn down.
+		remoteAudioTrack?.removeRenderer(audioTap)
+		remoteAudioTrack = nil
+		audioTap.finish()
+
 		connection.close()
 		stream.finish()
 	}
@@ -185,7 +200,14 @@ private extension WebRTCConnector {
 
 extension WebRTCConnector: LKRTCPeerConnectionDelegate {
 	public func peerConnectionShouldNegotiate(_: LKRTCPeerConnection) {}
-	public func peerConnection(_: LKRTCPeerConnection, didAdd _: LKRTCMediaStream) {}
+	public func peerConnection(_: LKRTCPeerConnection, didAdd stream: LKRTCMediaStream) {
+		// The model's voice arrives here as a remote track. Attaching the tap is
+		// what makes the audio observable at all; upstream left this empty and
+		// let WebRTC render the track with nothing able to see it.
+		guard let track = stream.audioTracks.first, remoteAudioTrack == nil else { return }
+		remoteAudioTrack = track
+		track.addRenderer(audioTap)
+	}
 	public func peerConnection(_: LKRTCPeerConnection, didOpen _: LKRTCDataChannel) {}
 	public func peerConnection(_: LKRTCPeerConnection, didRemove _: LKRTCMediaStream) {}
 	public func peerConnection(_: LKRTCPeerConnection, didChange _: LKRTCSignalingState) {}
