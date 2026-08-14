@@ -146,6 +146,14 @@ public final class Conversation: @unchecked Sendable {
 		try client.sendRaw(data)
 	}
 
+	// PATCH (Chip): ending a call has to actually END it. Without this the
+	// only way to close the peer connection is to drop every reference and
+	// wait for deinit, so a session outlives the call that owned it and its
+	// audio can still arrive over the next one.
+	public func disconnect() {
+		client.disconnect()
+	}
+
 	// PATCH (Chip): the connector is private, so the tapped remote audio is
 	// unreachable from app code without this. 16 kHz mono PCM16 of the model's
 	// voice, for driving a lip-synced avatar. Observing only.
