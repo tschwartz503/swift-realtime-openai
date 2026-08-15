@@ -26,8 +26,18 @@ public final class RemoteAudioTap: NSObject, LKRTCAudioRenderer, @unchecked Send
 	public let pcm16: AsyncStream<Data>
 	private let continuation: AsyncStream<Data>.Continuation
 
-	private var converter: AVAudioConverter?
-	private var converterInputFormat: AVAudioFormat?
+	// A resampler has to be CONTINUOUS. Converting each render callback in
+	// isolation - hand over one buffer, then report end-of-data - throws away
+	// the filter's tail every single time, and at 10ms buffers that is a fixed
+	// ~20% of every callback. Measured on device: 15.9s of audio produced from
+	// 19.8s of speech, exactly 80%, which Simli renders as a mouth running
+	// ahead of words that were never sent.
+	//
+	// So carry the state instead: unconsumed input samples and a fractional
+	// read position that survive between callbacks.
+	private var residual: [Float] = []
+	private var phase: Double = 0
+	private var inputRate: Double = 0
 
 	// The tap owns the track it is attached to. Keeping it here rather than on
 	// the connector matters: WebRTCConnector is @Observable and Sendable, so a
@@ -61,12 +71,8 @@ public final class RemoteAudioTap: NSObject, LKRTCAudioRenderer, @unchecked Send
 		existing?.remove(self)
 	}
 
-	private static let targetFormat = AVAudioFormat(
-		commonFormat: .pcmFormatInt16,
-		sampleRate: 16000,
-		channels: 1,
-		interleaved: true
-	)!
+	/// Simli's ingest rate, and what every consumer of this stream expects.
+	private static let targetSampleRate: Double = 16000
 
 	override public init() {
 		// Unbounded, deliberately. A consumer that renders a talking head from
@@ -95,38 +101,55 @@ public final class RemoteAudioTap: NSObject, LKRTCAudioRenderer, @unchecked Send
 	// MARK: - Conversion
 
 	private func convert(_ buffer: AVAudioPCMBuffer) -> Data? {
-		let target = Self.targetFormat
+		let rate = buffer.format.sampleRate
+		let frames = Int(buffer.frameLength)
+		guard rate > 0, frames > 0 else { return nil }
 
-		// Rebuild if WebRTC changes rate or channel count mid-session, which it
-		// can do on a route change.
-		if converter == nil || converterInputFormat != buffer.format {
-			converter = AVAudioConverter(from: buffer.format, to: target)
-			converterInputFormat = buffer.format
+		// A route change can move the hardware rate mid-session. Starting the
+		// phase over is a single-sample discontinuity; carrying a position
+		// measured against the old rate would skew everything after it.
+		if rate != inputRate {
+			residual.removeAll(keepingCapacity: true)
+			phase = 0
+			inputRate = rate
 		}
-		guard let converter else { return nil }
 
-		let ratio = target.sampleRate / buffer.format.sampleRate
-		let capacity = AVAudioFrameCount((Double(buffer.frameLength) * ratio).rounded(.up)) + 64
-		guard capacity > 0,
-		      let out = AVAudioPCMBuffer(pcmFormat: target, frameCapacity: capacity)
-		else { return nil }
-
-		// One input buffer per call: hand it over once, then report end-of-data
-		// so the converter drains rather than waiting for more.
-		var supplied = false
-		var error: NSError?
-		converter.convert(to: out, error: &error) { _, status in
-			if supplied {
-				status.pointee = .noDataNow
-				return nil
-			}
-			supplied = true
-			status.pointee = .haveData
-			return buffer
+		// Channel 0 only. The model is mono; a second channel is a duplicate.
+		let stride = buffer.format.isInterleaved ? Int(buffer.format.channelCount) : 1
+		if let floats = buffer.floatChannelData {
+			let src = floats[0]
+			for i in 0 ..< frames { residual.append(src[i * stride]) }
+		} else if let ints = buffer.int16ChannelData {
+			let src = ints[0]
+			for i in 0 ..< frames { residual.append(Float(src[i * stride]) / 32768.0) }
+		} else {
+			return nil
 		}
-		if error != nil { return nil }
 
-		guard out.frameLength > 0, let channel = out.int16ChannelData else { return nil }
-		return Data(bytes: channel[0], count: Int(out.frameLength) * MemoryLayout<Int16>.size)
+		// Linear interpolation at a fixed step. Every input sample is read and
+		// none is dropped, so output duration tracks input duration exactly.
+		let step = rate / Self.targetSampleRate
+		var out = [Int16]()
+		out.reserveCapacity(Int(Double(residual.count) / step) + 2)
+
+		var pos = phase
+		while pos + 1 < Double(residual.count) {
+			let index = Int(pos)
+			let frac = Float(pos - Double(index))
+			let sample = residual[index] + (residual[index + 1] - residual[index]) * frac
+			out.append(Int16(max(-32767, min(32767, sample * 32767))))
+			pos += step
+		}
+
+		// Keep whatever the next callback still needs to interpolate across.
+		let consumed = Int(pos)
+		if consumed > 0 {
+			residual.removeFirst(min(consumed, residual.count))
+			pos -= Double(consumed)
+		}
+		phase = pos
+
+		guard !out.isEmpty else { return nil }
+		return out.withUnsafeBufferPointer { Data(buffer: $0) }
 	}
 }
