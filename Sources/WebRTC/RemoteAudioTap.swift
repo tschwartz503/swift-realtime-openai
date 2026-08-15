@@ -35,9 +35,17 @@ public final class RemoteAudioTap: NSObject, LKRTCAudioRenderer, @unchecked Send
 	//
 	// So carry the state instead: unconsumed input samples and a fractional
 	// read position that survive between callbacks.
-	private var residual: [Float] = []
 	private var phase: Double = 0
 	private var inputRate: Double = 0
+	/// One sample of history is all linear interpolation needs across a
+	/// callback boundary. Accumulating a buffer instead meant a heap allocation
+	/// and an O(n) shift on WebRTC's realtime render thread every 10ms, which
+	/// glitches the audio the user is actually listening to.
+	private var lastSample: Float = 0
+
+	/// Seconds of audio in and out, for diagnosing where duration goes missing.
+	public private(set) var inputSeconds: Double = 0
+	public private(set) var outputSeconds: Double = 0
 
 	// The tap owns the track it is attached to. Keeping it here rather than on
 	// the connector matters: WebRTCConnector is @Observable and Sendable, so a
@@ -105,51 +113,51 @@ public final class RemoteAudioTap: NSObject, LKRTCAudioRenderer, @unchecked Send
 		let frames = Int(buffer.frameLength)
 		guard rate > 0, frames > 0 else { return nil }
 
-		// A route change can move the hardware rate mid-session. Starting the
-		// phase over is a single-sample discontinuity; carrying a position
-		// measured against the old rate would skew everything after it.
 		if rate != inputRate {
-			residual.removeAll(keepingCapacity: true)
 			phase = 0
+			lastSample = 0
 			inputRate = rate
 		}
+		inputSeconds += Double(frames) / rate
 
-		// Channel 0 only. The model is mono; a second channel is a duplicate.
 		let stride = buffer.format.isInterleaved ? Int(buffer.format.channelCount) : 1
+		let step = rate / Self.targetSampleRate
+
+		// Read straight from WebRTC's buffer. No copy, no accumulation, no
+		// shifting - this runs on the realtime render thread and anything that
+		// allocates or moves memory here is audible in the playback itself.
+		func render(_ sampleAt: (Int) -> Float) -> [Int16] {
+			var out = [Int16]()
+			out.reserveCapacity(Int(Double(frames) / step) + 2)
+			var pos = phase
+			// Index -1 is the last sample of the previous callback, which is
+			// what makes the seam between buffers continuous.
+			while pos < Double(frames) - 1 {
+				let index = Int(pos.rounded(.down))
+				let frac = Float(pos - Double(index))
+				let a = index < 0 ? lastSample : sampleAt(index)
+				let b = sampleAt(index + 1)
+				out.append(Int16(max(-32767, min(32767, (a + (b - a) * frac) * 32767))))
+				pos += step
+			}
+			phase = pos - Double(frames)
+			lastSample = sampleAt(frames - 1)
+			return out
+		}
+
+		var samples: [Int16]
 		if let floats = buffer.floatChannelData {
 			let src = floats[0]
-			for i in 0 ..< frames { residual.append(src[i * stride]) }
+			samples = render { src[$0 * stride] }
 		} else if let ints = buffer.int16ChannelData {
 			let src = ints[0]
-			for i in 0 ..< frames { residual.append(Float(src[i * stride]) / 32768.0) }
+			samples = render { Float(src[$0 * stride]) / 32768.0 }
 		} else {
 			return nil
 		}
 
-		// Linear interpolation at a fixed step. Every input sample is read and
-		// none is dropped, so output duration tracks input duration exactly.
-		let step = rate / Self.targetSampleRate
-		var out = [Int16]()
-		out.reserveCapacity(Int(Double(residual.count) / step) + 2)
-
-		var pos = phase
-		while pos + 1 < Double(residual.count) {
-			let index = Int(pos)
-			let frac = Float(pos - Double(index))
-			let sample = residual[index] + (residual[index + 1] - residual[index]) * frac
-			out.append(Int16(max(-32767, min(32767, sample * 32767))))
-			pos += step
-		}
-
-		// Keep whatever the next callback still needs to interpolate across.
-		let consumed = Int(pos)
-		if consumed > 0 {
-			residual.removeFirst(min(consumed, residual.count))
-			pos -= Double(consumed)
-		}
-		phase = pos
-
-		guard !out.isEmpty else { return nil }
-		return out.withUnsafeBufferPointer { Data(buffer: $0) }
+		guard !samples.isEmpty else { return nil }
+		outputSeconds += Double(samples.count) / Self.targetSampleRate
+		return samples.withUnsafeBufferPointer { Data(buffer: $0) }
 	}
 }
