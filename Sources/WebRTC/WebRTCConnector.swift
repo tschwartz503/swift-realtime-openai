@@ -1,10 +1,19 @@
 import Core
 import AVFAudio
 import Foundation
+import os
 @preconcurrency import LiveKitWebRTC
 #if canImport(FoundationNetworking)
 import FoundationNetworking
 #endif
+
+/// Where this connector reports what it could not deliver.
+///
+/// `com.chip.voice` so it lands beside the app's own voice trace; anything
+/// reading one is already reading the other.
+enum ConnectorLog {
+	static let logger = Logger(subsystem: "com.chip.voice", category: "realtime-sdk")
+}
 
 @Observable public final class WebRTCConnector: NSObject, Connector, Sendable {
 	public enum WebRTCError: Error {
@@ -221,9 +230,22 @@ extension WebRTCConnector: LKRTCDataChannelDelegate {
 	public func dataChannel(_: LKRTCDataChannel, didReceiveMessageWith buffer: LKRTCDataBuffer) {
 		// Skip (don't crash the stream on) unknown/undecodable events. Patch:
 		// must NOT stream.finish(throwing:) here or one unknown event kills the
-		// whole voice session. Silent — no console dump of the event payload.
+		// whole voice session.
+		//
+		// BUT SAY SO. This was `catch {}`, and the silence is what made a
+		// one-string enum gap (see Model.Transcription) cost months: every
+		// session.created was being thrown away here and nothing anywhere said
+		// a word. An event we cannot decode is still an event we did not
+		// deliver, and the caller is entitled to know the class of thing it
+		// just lost.
+		//
+		// The TYPE only, never the payload — realtime events carry the user's
+		// speech, and a log line is not a place to put it.
 		do { try stream.yield(decoder.decode(ServerEvent.self, from: buffer.data)) }
-		catch {}
+		catch {
+			let type = ((try? JSONSerialization.jsonObject(with: buffer.data)) as? [String: Any])?["type"] as? String
+			ConnectorLog.logger.error("dropped undecodable server event type=\(type ?? "unknown", privacy: .public) error=\(String(describing: error), privacy: .public)")
+		}
 	}
 
 	public func dataChannelDidChangeState(_ dataChannel: LKRTCDataChannel) {
